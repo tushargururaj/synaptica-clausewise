@@ -1,2 +1,4 @@
 .env
+logs
 __pycache__
+app_logger.py

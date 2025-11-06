@@ -25,8 +25,14 @@ from __future__ import annotations
 
 import os
 import json
+import re
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
+from app_logger import get_logger, init_logging
+
+# Initialize logging early
+init_logging()
+logger = get_logger(__name__)
 
 # ---- Simple document parsing ----
 from pypdf import PdfReader
@@ -142,24 +148,35 @@ entities_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You are a careful legal information extractor. Extract key entities and clauses from the document. "
-            "Return STRICT JSON ONLY with these top-level keys:\n"
+            "You are an expert legal document analyzer. Extract key entities and information from the legal document. "
+            "You MUST return a VALID JSON object with this EXACT structure:\n"
             "{{\n"
             "  \"entities\": {{\n"
-            "    \"parties\": [\"...\"],\n"
-            "    \"effective_date\": \"...\",\n"
-            "    \"termination_date\": \"...\",\n"
-            "    \"governing_law\": \"...\",\n"
-            "    \"notice_periods\": \"...\",\n"
-            "    \"liability_provisions\": \"...\",\n"
-            "    \"confidentiality_terms\": \"...\",\n"
-            "    \"payment_terms\": \"...\",\n"
-            "    \"ip_rights\": \"...\"\n"
+            "    \"parties\": [\"party name 1\", \"party name 2\"],\n"
+            "    \"effective_date\": \"date or null\",\n"
+            "    \"termination_date\": \"date or null\",\n"
+            "    \"governing_law\": \"jurisdiction or null\",\n"
+            "    \"notice_periods\": \"notice requirement or null\",\n"
+            "    \"liability_provisions\": \"liability terms or null\",\n"
+            "    \"confidentiality_terms\": \"confidentiality requirement or null\",\n"
+            "    \"payment_terms\": \"payment details or null\",\n"
+            "    \"ip_rights\": \"intellectual property terms or null\"\n"
             "  }}\n"
-            "}}\n"
-            "Use null where unknown. No extra commentary."
+            "}}\n\n"
+            "IMPORTANT:\n"
+            "- Extract real values from the document text\n"
+            "- Use null (not the string \"null\") only if information is truly not found\n"
+            "- For parties: extract names of individuals, companies, or organizations\n"
+            "- For dates: extract in format like \"January 1, 2024\" or \"2024-01-01\" or \"2024-05-01\"\n"
+            "- For termination_date: Look for phrases like 'valid from X to Y', 'from X until Y', 'expires on Y', 'ends on Y', 'to Y', 'until Y'\n"
+            "- If you see date ranges like 'from May 1, 2024, to March 31, 2025', extract:\n"
+            "  * effective_date: the first date (May 1, 2024)\n"
+            "  * termination_date: the second date (March 31, 2025)\n"
+            "- Look carefully for ALL dates mentioned - don't miss termination dates in date ranges\n"
+            "- Return ONLY valid JSON, no explanations, no markdown, no code blocks\n"
+            "- If you find information, include it even if incomplete"
         ),
-        ("human", "Document text:\n\n{doc_text}"),
+        ("human", "Extract entities from this legal document:\n\n{doc_text}\n\nReturn the JSON object now:"),
     ]
 )
 
@@ -359,31 +376,11 @@ risk_reason_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You are a contract risk analyst explaining risks to non-lawyers. For each clause with a risk score and tag, provide a clear, actionable risk explanation.\n\n"
-            "Your task: Add a \"Risk\" field to each clause explaining:\n"
-            "1. What specific risk exists (be concrete, not vague)\n"
-            "2. Why this particular clause creates that risk\n"
-            "3. What could go wrong in practical terms\n\n"
-            "GUIDELINES:\n"
-            "- Write in plain, simple language (avoid legal jargon)\n"
-            "- Be specific: Instead of 'may cause problems', say 'could result in unlimited financial liability'\n"
-            "- Explain the CONSEQUENCE: What happens if this clause is enforced?\n"
-            "- Match the severity to the risk score:\n"
-            "  * HIGH risk: Describe serious consequences (financial loss, legal liability, career impact)\n"
-            "  * MEDIUM risk: Describe moderate concerns (inconvenience, extra costs, limited flexibility)\n"
-            "  * LOW risk: Note minor concerns or standard industry practice\n"
-            "- For LOW risk clauses, you can acknowledge it's standard or explain why it's generally acceptable\n"
-            "- Keep it concise: 1-3 sentences, maximum 50 words\n"
-            "- Focus on WHAT the risk is, not just restating the clause\n\n"
-            "EXAMPLES:\n"
-            "- Good: \"This clause requires unlimited liability for any damages, which means you could be held responsible for costs far exceeding the contract value if something goes wrong.\"\n"
-            "- Good: \"The non-compete restriction prevents you from working in your industry for 2 years across the entire country, which could severely limit future employment opportunities.\"\n"
-            "- Good: \"This is a standard confidentiality clause that protects both parties' information equally, which is typical and fair in most agreements.\"\n"
-            "- Bad: \"This clause may have risks.\" (too vague)\n"
-            "- Bad: \"The clause states that...\" (just restating, not explaining risk)\n\n"
-            "Return STRICT JSON ARRAY with each clause having an added \"Risk\" field. No commentary."
+            "Add a \"Risk\" field to each clause explaining the risk in 1-2 sentences (max 50 words). "
+            "Match severity to risk score: HIGH=serious consequences, MEDIUM=moderate concerns, LOW=standard/minor. "
+            "Be specific about consequences. Return STRICT JSON ARRAY only, no commentary."
         ),
-        ("human", "Clauses with risk tags and scores:\n{risked_json}"),
+        ("human", "Clauses:\n{risked_json}"),
     ]
 )
 
@@ -526,24 +523,220 @@ def classify_document(doc_text: str) -> Dict[str, Any]:
     # If all candidates failed, return a safe default
     return {"classification": "Other", "_error": str(last_err) if last_err else None}
 
+def _simple_entity_extraction(doc_text: str) -> Dict[str, Any]:
+    """Simple regex-based fallback entity extraction."""
+    entities = {
+        "parties": [],
+        "effective_date": None,
+        "termination_date": None,
+        "governing_law": None,
+        "notice_periods": None,
+        "liability_provisions": None,
+        "confidentiality_terms": None,
+        "payment_terms": None,
+        "ip_rights": None
+    }
+    
+    text_lower = doc_text.lower()
+    
+    # Try to find dates - improved patterns
+    # Look for date ranges first (e.g., "from X to Y", "valid from X to Y")
+    date_range_patterns = [
+        r'(?:valid\s+)?from\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})\s+to\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
+        r'(?:from|starting)\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})\s+(?:until|to|till)\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
+        r'(\d{4}[/-]\d{1,2}[/-]\d{1,2})\s+to\s+(\d{4}[/-]\d{1,2}[/-]\d{1,2})',
+        r'(\d{1,2}[/-]\d{1,2}[/-]\d{4})\s+to\s+(\d{1,2}[/-]\d{1,2}[/-]\d{4})',
+    ]
+    
+    for pattern in date_range_patterns:
+        match = re.search(pattern, doc_text, re.IGNORECASE)
+        if match:
+            entities["effective_date"] = match.group(1).strip()
+            entities["termination_date"] = match.group(2).strip()
+            break
+    
+    # If no range found, look for individual dates
+    if not entities["termination_date"]:
+        date_patterns = [
+            r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},?\s+\d{4}\b',
+            r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b',
+            r'\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b',
+        ]
+        dates_found = []
+        for pattern in date_patterns:
+            matches = re.findall(pattern, doc_text, re.IGNORECASE)
+            dates_found.extend(matches)
+        
+        if dates_found:
+            entities["effective_date"] = dates_found[0] if len(dates_found) > 0 else None
+            entities["termination_date"] = dates_found[1] if len(dates_found) > 1 else None
+        
+        # Also look for termination-specific phrases
+        termination_patterns = [
+            r'(?:expires?|ends?|terminates?|valid until)\s+(?:on\s+)?([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
+            r'(?:expires?|ends?|terminates?|valid until)\s+(?:on\s+)?(\d{4}[/-]\d{1,2}[/-]\d{1,2})',
+            r'(?:expires?|ends?|terminates?|valid until)\s+(?:on\s+)?(\d{1,2}[/-]\d{1,2}[/-]\d{4})',
+        ]
+        for pattern in termination_patterns:
+            match = re.search(pattern, doc_text, re.IGNORECASE)
+            if match:
+                entities["termination_date"] = match.group(1).strip()
+                break
+    
+    # Try to find payment terms (look for currency symbols and amounts)
+    payment_patterns = [
+        r'[₹$€£]\s*\d+[,\d]*',
+        r'rupees?\s+\d+[,\d]*',
+        r'payment.*?(\d+\s*(days?|months?|weeks?))',
+    ]
+    for pattern in payment_patterns:
+        match = re.search(pattern, text_lower, re.IGNORECASE)
+        if match:
+            entities["payment_terms"] = match.group(0)
+            break
+    
+    # Try to find governing law
+    law_patterns = [
+        r'governed?\s+by\s+the\s+laws?\s+of\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
+        r'jurisdiction.*?([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
+    ]
+    for pattern in law_patterns:
+        match = re.search(pattern, text_lower, re.IGNORECASE)
+        if match:
+            entities["governing_law"] = match.group(1) if match.lastindex else match.group(0)
+            break
+    
+    return entities
+
+
 def extract_entities(doc_text: str) -> Dict[str, Any]:
-    llm = build_llm(MAIN_LLM_REPO, max_new_tokens=512, temperature=0.1)
-    chain = entities_prompt | llm | StrOutputParser()
-    raw = chain.invoke({"doc_text": doc_text[:10000]})
+    """Extract entities from document text with fallback."""
+    default_entities = {
+        "parties": [],
+        "effective_date": None,
+        "termination_date": None,
+        "governing_law": None,
+        "notice_periods": None,
+        "liability_provisions": None,
+        "confidentiality_terms": None,
+        "payment_terms": None,
+        "ip_rights": None
+    }
+    
     try:
-        return json.loads(_extract_json(raw))
-    except Exception:
-        return {"entities": {
-            "parties": [],
-            "effective_date": None,
-            "termination_date": None,
-            "governing_law": None,
-            "notice_periods": None,
-            "liability_provisions": None,
-            "confidentiality_terms": None,
-            "payment_terms": None,
-            "ip_rights": None
-        }}
+        # Use more tokens for better extraction - increased to handle full response
+        llm = build_llm(MAIN_LLM_REPO, max_new_tokens=1200, temperature=0.1)
+        chain = entities_prompt | llm | StrOutputParser()
+        raw = chain.invoke({"doc_text": doc_text[:12000]})  # Increased text limit
+        
+        # Clean the response
+        raw = raw.strip()
+        # Remove markdown code blocks if present
+        if raw.startswith("```json"):
+            raw = raw[7:]
+        if raw.startswith("```"):
+            raw = raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+        raw = raw.strip()
+        
+        try:
+            json_str = _extract_json(raw)
+            result = json.loads(json_str)
+            
+            # Validate and normalize structure
+            if isinstance(result, dict):
+                if "entities" in result:
+                    entities = result["entities"]
+                elif all(k in result for k in default_entities.keys()):
+                    # If entities are at top level
+                    entities = result
+                else:
+                    # Try to use the whole dict as entities
+                    entities = result
+                
+                # Ensure all required keys exist
+                final_entities = default_entities.copy()
+                for key in default_entities.keys():
+                    if key in entities:
+                        value = entities[key]
+                        # Convert string "null" to actual None
+                        if value == "null" or value == "None":
+                            value = None
+                        final_entities[key] = value
+                
+                # Validate that we got at least some non-null values
+                non_null_count = sum(1 for v in final_entities.values() if v is not None and v != [])
+                
+                if non_null_count > 0:
+                    return {"entities": final_entities}
+                else:
+                    # All values are null, try fallback
+                    logger.warning("Entities: All values null; using fallback extraction")
+                    fallback = _simple_entity_extraction(doc_text)
+                    return {"entities": fallback, "_warning": "Used fallback extraction - LLM returned all nulls"}
+            
+            return {"entities": default_entities, "_error": "Invalid response format from LLM"}
+            
+        except json.JSONDecodeError as e:
+            # Try to repair truncated JSON
+            logger.error("Entities: JSON parse error; attempting repair", exc_info=True)
+            
+            try:
+                repaired = _repair_truncated_json(_extract_json(raw))
+                result = json.loads(repaired)
+                
+                # Process the repaired JSON
+                if isinstance(result, dict):
+                    if "entities" in result:
+                        entities = result["entities"]
+                    else:
+                        entities = result
+                    
+                    final_entities = default_entities.copy()
+                    for key in default_entities.keys():
+                        if key in entities:
+                            value = entities[key]
+                            if value == "null" or value == "None":
+                                value = None
+                            final_entities[key] = value
+                    
+                    non_null_count = sum(1 for v in final_entities.values() if v is not None and v != [])
+                    if non_null_count > 0:
+                        logger.info("Entities: Repaired and parsed truncated JSON successfully")
+                        return {"entities": final_entities, "_warning": "JSON was truncated but repaired"}
+            except Exception as repair_error:
+                logger.error("Entities: JSON repair failed", exc_info=True)
+            
+            # Try to extract partial data from incomplete JSON
+            try:
+                partial_entities = _extract_partial_entities(raw)
+                non_null_count = sum(1 for v in partial_entities.values() if v is not None and v != [])
+                if non_null_count > 0:
+                    logger.info("Entities: Extracted partial fields from incomplete JSON")
+                    return {"entities": partial_entities, "_warning": "Extracted partial data from incomplete JSON"}
+            except Exception as partial_error:
+                logger.error("Entities: Partial extraction failed", exc_info=True)
+            
+            # Final fallback: regex extraction from document
+            logger.warning("Entities: Using regex-based fallback extraction from document text")
+            fallback = _simple_entity_extraction(doc_text)
+            return {"entities": fallback, "_error": f"JSON parse error, used fallback: {str(e)}"}
+            
+    except StopIteration as e:
+        logger.error("Entities: StopIteration from API (truncated response)", exc_info=True)
+        # Try fallback
+        fallback = _simple_entity_extraction(doc_text)
+        return {"entities": fallback, "_error": "API returned incomplete response, used fallback extraction"}
+        
+    except Exception as e:
+        logger.error("Entities: Extraction failed", exc_info=True)
+        # Try fallback extraction
+        fallback = _simple_entity_extraction(doc_text)
+        return {"entities": fallback, "_error": str(e)}
+    
+    # Final fallback
+    return {"entities": default_entities, "_error": "Unknown error"}
 
 def split_text(doc_text: str, *, chunk_size: int = 1500, chunk_overlap: int = 150) -> List[str]:
     splitter = RecursiveCharacterTextSplitter(
@@ -590,9 +783,31 @@ def add_plain_explanations(clauses: List[Dict[str, Any]]) -> List[Dict[str, Any]
             merged = _merge_llm_response(clauses, llm_result, field_to_match="text")
             
             # Verify all clauses have explanations, add fallback if missing
-            # Also clean explanations to remove personalized content
+            # Also clean explanations to remove redundant prefixes and personalized content
             for i, clause in enumerate(merged):
                 expl = clause.get("explanation", "").strip()
+                
+                # Remove redundant prefixes like "This clause states:"
+                if expl:
+                    redundant_prefixes = [
+                        "this clause states:",
+                        "this clause states",
+                        "the clause states:",
+                        "the clause states",
+                        "clause states:",
+                        "clause states",
+                        "this states:",
+                        "this states",
+                    ]
+                    
+                    expl_lower = expl.lower()
+                    for prefix in redundant_prefixes:
+                        if expl_lower.startswith(prefix):
+                            expl = expl[len(prefix):].strip()
+                            # Remove leading colon if present
+                            if expl.startswith(":"):
+                                expl = expl[1:].strip()
+                            break
                 
                 # Remove personalized content from explanations
                 if expl:
@@ -605,6 +820,28 @@ def add_plain_explanations(clauses: List[Dict[str, Any]]) -> List[Dict[str, Any]
                             continue
                             
                         lower_sent = sent.lower()
+                        
+                        # Remove redundant prefixes from individual sentences
+                        redundant_prefixes = [
+                            "this clause states:",
+                            "this clause states",
+                            "the clause states:",
+                            "the clause states",
+                            "clause states:",
+                            "clause states",
+                            "this states:",
+                            "this states",
+                        ]
+                        for prefix in redundant_prefixes:
+                            if lower_sent.startswith(prefix):
+                                sent = sent[len(prefix):].strip()
+                                if sent.startswith(":"):
+                                    sent = sent[1:].strip()
+                                lower_sent = sent.lower()
+                                break
+                        
+                        if not sent:  # Skip if sentence became empty after prefix removal
+                            continue
                         
                         # Check for personalized phrases anywhere in the sentence
                         personalized_phrases = [
@@ -640,10 +877,10 @@ def add_plain_explanations(clauses: List[Dict[str, Any]]) -> List[Dict[str, Any]
                         if not clause["explanation"].endswith("."):
                             clause["explanation"] += "."
                     else:
-                        # If all sentences were removed, generate a generic one
+                        # If all sentences were removed, generate a generic one (without redundant prefix)
                         clause_text = clause.get("text", "").strip()
                         if clause_text:
-                            clause["explanation"] = f"This clause states: {clause_text[:100]}{'...' if len(clause_text) > 100 else ''}"
+                            clause["explanation"] = clause_text[:100] + ('...' if len(clause_text) > 100 else '')
                 
                 if not clause.get("explanation") or not str(clause.get("explanation", "")).strip():
                     # Try to get from LLM result by position
@@ -652,69 +889,266 @@ def add_plain_explanations(clauses: List[Dict[str, Any]]) -> List[Dict[str, Any]
                         for key in ["explanation", "Explanation", "EXPLANATION", "plain_explanation"]:
                             if key in llm_clause and llm_clause[key] and str(llm_clause[key]).strip():
                                 expl_text = str(llm_clause[key]).strip()
-                                # Clean it before assigning
+                                
+                                # Clean redundant prefixes before assigning
+                                expl_lower = expl_text.lower()
+                                redundant_prefixes_local = [
+                                    "this clause states:",
+                                    "this clause states",
+                                    "the clause states:",
+                                    "the clause states",
+                                    "clause states:",
+                                    "clause states",
+                                    "this states:",
+                                    "this states",
+                                ]
+                                for prefix in redundant_prefixes_local:
+                                    if expl_lower.startswith(prefix):
+                                        expl_text = expl_text[len(prefix):].strip()
+                                        if expl_text.startswith(":"):
+                                            expl_text = expl_text[1:].strip()
+                                        break
+                                
+                                # Skip personalized explanations
                                 if any(expl_text.lower().startswith(prefix) for prefix in [
                                     "as a", "as an", "for someone", "imagine"
                                 ]):
-                                    continue  # Skip personalized explanations
+                                    continue
                                 clause["explanation"] = expl_text
                                 break
-                    # If still no explanation, generate a simple one from the text
+                    # If still no explanation, generate a simple one from the text (without redundant prefix)
                     if not clause.get("explanation") or not str(clause.get("explanation", "")).strip():
                         clause_text = clause.get("text", "").strip()
                         if clause_text:
-                            clause["explanation"] = f"This clause states: {clause_text[:100]}{'...' if len(clause_text) > 100 else ''}"
+                            clause["explanation"] = clause_text[:100] + ('...' if len(clause_text) > 100 else '')
             
             return merged
     except Exception as e:
         # If parsing fails, try to generate basic explanations
         pass
     
-    # Final fallback: ensure explanation field exists for all clauses
+    # Final fallback: ensure explanation field exists for all clauses (without redundant prefix)
     for c in clauses:
         if not c.get("explanation") or not str(c.get("explanation", "")).strip():
             clause_text = c.get("text", "").strip()
             if clause_text:
-                c["explanation"] = f"This clause states: {clause_text[:100]}{'...' if len(clause_text) > 100 else ''}"
+                c["explanation"] = clause_text[:100] + ('...' if len(clause_text) > 100 else '')
             else:
                 c["explanation"] = "This clause requires review."
     
     return clauses
 
 def add_risk_scores(clauses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    llm = build_llm(MAIN_LLM_REPO, max_new_tokens=512, temperature=0.2)
-    payload = json.dumps(clauses, ensure_ascii=False)
-    chain = risk_prompt | llm | StrOutputParser()
-    raw = chain.invoke({"explained_json": payload})
+    if not clauses:
+        return clauses
+    
     try:
-        llm_result = json.loads(_extract_json(raw))
-        if isinstance(llm_result, list) and len(llm_result) > 0:
-            # Merge LLM response with existing clauses
-            return _merge_llm_response(clauses, llm_result, field_to_match="text")
-    except Exception:
-        pass
+        # Increase token limit to prevent truncation
+        llm = build_llm(MAIN_LLM_REPO, max_new_tokens=1500, temperature=0.2)
+        # Limit payload size if too large
+        payload = json.dumps(clauses, ensure_ascii=False)
+        if len(payload) > 8000:
+            # Process in smaller batches if payload is too large
+            logger.warning("Risk scoring: payload too large (%d chars); using fallback for batch", len(payload))
+            for c in clauses:
+                c.setdefault("Risk score", "medium")
+                c.setdefault("risk tag", "Legal")
+            return clauses
+        
+        chain = risk_prompt | llm | StrOutputParser()
+        raw = chain.invoke({"explained_json": payload})
+        
+        # Clean the response
+        raw = raw.strip()
+        if raw.startswith("```json"):
+            raw = raw[7:]
+        if raw.startswith("```"):
+            raw = raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+        raw = raw.strip()
+        
+        try:
+            json_str = _extract_json(raw)
+            llm_result = json.loads(json_str)
+            
+            if isinstance(llm_result, list) and len(llm_result) > 0:
+                # Merge LLM response with existing clauses
+                merged = _merge_llm_response(clauses, llm_result, field_to_match="text")
+                # Validate that risk scores were added
+                if any(c.get("Risk score") for c in merged):
+                    return merged
+                else:
+                    logger.warning("Risk scoring: LLM returned without risk fields; using fallback")
+            else:
+                logger.error("Risk scoring: Invalid response type: %s", type(llm_result))
+        except json.JSONDecodeError as e:
+            logger.error("Risk scoring: JSON parse error; attempting repair", exc_info=True)
+            
+            # Try to repair truncated JSON with improved method
+            try:
+                json_str = _extract_json(raw)
+                repaired = _repair_truncated_json(json_str)
+                llm_result = json.loads(repaired)
+                
+                if isinstance(llm_result, list) and len(llm_result) > 0:
+                    merged = _merge_llm_response(clauses, llm_result, field_to_match="text")
+                    # Check if we got at least some risk scores
+                    risk_count = sum(1 for c in merged if c.get("Risk score"))
+                    if risk_count > 0:
+                        logger.info("Risk scoring: Repaired truncated JSON; got %d scores", risk_count)
+                        # Fill in missing risk scores for remaining clauses
+                        for c in merged:
+                            if not c.get("Risk score"):
+                                c.setdefault("Risk score", "medium")
+                                c.setdefault("risk tag", "Legal")
+                        return merged
+            except Exception as repair_error:
+                logger.error("Risk scoring: JSON repair failed", exc_info=True)
+                # Try extracting partial risk scores from incomplete JSON
+                try:
+                    partial_risks = _extract_partial_risk_scores(raw, clauses)
+                    if partial_risks:
+                        logger.info("Risk scoring: Extracted %d partial scores from incomplete JSON", len(partial_risks))
+                        return partial_risks
+                except Exception as partial_error:
+                    logger.error("Risk scoring: Partial extraction failed", exc_info=True)
+            
+            logger.debug("Risk scoring: Raw response preview: %s", raw[:500])
+            
+        except Exception as e:
+            logger.error("Risk scoring: Merge error", exc_info=True)
+    except StopIteration as e:
+        logger.error("Risk scoring: StopIteration (truncated response)", exc_info=True)
+    except Exception as e:
+        logger.error("Risk scoring: LLM call failed", exc_info=True)
+    
     # Fallback: ensure risk fields exist
+    logger.warning("Risk scoring: Using fallback scores (medium/Legal)")
     for c in clauses:
         c.setdefault("Risk score", "medium")
         c.setdefault("risk tag", "Legal")
     return clauses
 
 def add_risk_text(clauses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    llm = build_llm(MAIN_LLM_REPO, max_new_tokens=512, temperature=0.2)
-    payload = json.dumps(clauses, ensure_ascii=False)
-    chain = risk_reason_prompt | llm | StrOutputParser()
-    raw = chain.invoke({"risked_json": payload})
+    if not clauses:
+        return clauses
+    
+    # Create a minimal payload with only essential fields to reduce size
+    minimal_clauses = []
+    for clause in clauses:
+        minimal = {
+            "id": clause.get("id"),
+            "text": clause.get("text", "")[:300],  # Truncate long texts
+            "title": clause.get("title", ""),
+            "Risk score": clause.get("Risk score", "medium"),
+            "risk tag": clause.get("risk tag", "Legal")
+        }
+        minimal_clauses.append(minimal)
+    
+    payload = json.dumps(minimal_clauses, ensure_ascii=False)
+    
+    # Process in batches if payload is too large
+    if len(payload) > 6000:
+        # Split into smaller batches
+        batch_size = max(3, len(clauses) // 3)  # Process in 3 batches
+        result = []
+        
+        for i in range(0, len(clauses), batch_size):
+            batch = clauses[i:i + batch_size]
+            batch_minimal = []
+            for clause in batch:
+                minimal = {
+                    "id": clause.get("id"),
+                    "text": clause.get("text", "")[:300],
+                    "title": clause.get("title", ""),
+                    "Risk score": clause.get("Risk score", "medium"),
+                    "risk tag": clause.get("risk tag", "Legal")
+                }
+                batch_minimal.append(minimal)
+            
+            batch_payload = json.dumps(batch_minimal, ensure_ascii=False)
+            batch_result = _process_risk_text_batch(batch, batch_payload)
+            result.extend(batch_result)
+        
+        return result
+    
+    # Process all at once if payload is small enough
+    return _process_risk_text_batch(clauses, payload)
+
+
+def _process_risk_text_batch(clauses: List[Dict[str, Any]], payload: str) -> List[Dict[str, Any]]:
+    """Process a batch of clauses to add risk text."""
     try:
-        llm_result = json.loads(_extract_json(raw))
-        if isinstance(llm_result, list) and len(llm_result) > 0:
-            # Merge LLM response with existing clauses
-            return _merge_llm_response(clauses, llm_result, field_to_match="text")
-    except Exception:
-        pass
-    # Fallback: ensure Risk field exists
+        # Increase token limit for better responses
+        llm = build_llm(MAIN_LLM_REPO, max_new_tokens=800, temperature=0.2)
+        chain = risk_reason_prompt | llm | StrOutputParser()
+        raw = chain.invoke({"risked_json": payload})
+        
+        # Clean the response
+        raw = raw.strip()
+        if raw.startswith("```json"):
+            raw = raw[7:]
+        if raw.startswith("```"):
+            raw = raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+        raw = raw.strip()
+        
+        try:
+            json_str = _extract_json(raw)
+            llm_result = json.loads(json_str)
+            
+            if isinstance(llm_result, list) and len(llm_result) > 0:
+                # Merge LLM response with existing clauses
+                merged = _merge_llm_response(clauses, llm_result, field_to_match="text")
+                # Validate that risk text was added
+                if any(c.get("Risk") for c in merged):
+                    return merged
+                else:
+                    print("Risk text not found in LLM response")
+        except json.JSONDecodeError as e:
+            logger.error("Risk text: JSON parse error; attempting repair", exc_info=True)
+            
+            # Try to repair truncated JSON
+            try:
+                repaired = _repair_truncated_json(_extract_json(raw))
+                llm_result = json.loads(repaired)
+                
+                if isinstance(llm_result, list) and len(llm_result) > 0:
+                    merged = _merge_llm_response(clauses, llm_result, field_to_match="text")
+                    risk_count = sum(1 for c in merged if c.get("Risk"))
+                    if risk_count > 0:
+                        logger.info("Risk text: Repaired truncated JSON; got %d texts", risk_count)
+                        # Fill in missing risk text
+                        for c in merged:
+                            if not c.get("Risk"):
+                                c.setdefault("Risk", _generate_default_risk_text(c.get("Risk score", "medium")))
+                        return merged
+            except Exception as repair_error:
+                logger.error("Risk text: JSON repair failed", exc_info=True)
+        
+    except StopIteration as e:
+        logger.error("Risk text: StopIteration", exc_info=True)
+    except Exception as e:
+        logger.error("Risk text: processing failed", exc_info=True)
+    
+    # Fallback: generate default risk text based on risk score
     for c in clauses:
-        c.setdefault("Risk", "This clause may create exposure depending on how it is enforced.")
+        if not c.get("Risk"):
+            c["Risk"] = _generate_default_risk_text(c.get("Risk score", "medium"))
     return clauses
+
+
+def _generate_default_risk_text(risk_score: str) -> str:
+    """Generate a default risk text based on risk score."""
+    risk_lower = (risk_score or "medium").lower()
+    if risk_lower == "high":
+        return "This clause creates significant exposure that could result in substantial financial loss or legal liability."
+    elif risk_lower == "medium":
+        return "This clause may create moderate exposure or inconvenience depending on how it is enforced."
+    else:
+        return "This clause is generally standard and creates minimal exposure."
 
 def add_scenarios(clauses: List[Dict[str, Any]], *, user_background: str = "") -> List[Dict[str, Any]]:
     llm = build_llm(MAIN_LLM_REPO, max_new_tokens=600, temperature=0.2)
@@ -753,10 +1187,10 @@ def add_scenarios(clauses: List[Dict[str, Any]], *, user_background: str = "") -
                             if not clause["explanation"].endswith("."):
                                 clause["explanation"] += "."
                         else:
-                            # Fallback to simple explanation
+                            # Fallback to simple explanation (without redundant prefix)
                             clause_text = clause.get("text", "").strip()
                             if clause_text:
-                                clause["explanation"] = f"This clause states: {clause_text[:100]}{'...' if len(clause_text) > 100 else ''}"
+                                clause["explanation"] = clause_text[:100] + ('...' if len(clause_text) > 100 else '')
             
             return merged
     except Exception:
@@ -770,6 +1204,50 @@ def add_scenarios(clauses: List[Dict[str, Any]], *, user_background: str = "") -
 # =====================
 # Orchestration / Pipeline
 # =====================
+def _enhance_entities_from_clauses(entities: Dict[str, Any], clauses: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Enhance entities by extracting missing information from clauses."""
+    if not clauses:
+        return entities
+    
+    # Combine all clause texts for better extraction
+    all_clause_text = " ".join([c.get("text", "") for c in clauses])
+    
+    # If termination_date is missing, try to extract from clauses
+    if not entities.get("termination_date") or entities.get("termination_date") == "null":
+        # Look for date ranges in clause text
+        date_range_patterns = [
+            r'(?:valid\s+)?from\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})\s+to\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
+            r'(?:from|starting)\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})\s+(?:until|to|till)\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
+            r'(\d{4}[/-]\d{1,2}[/-]\d{1,2})\s+to\s+(\d{4}[/-]\d{1,2}[/-]\d{1,2})',
+            r'(\d{1,2}[/-]\d{1,2}[/-]\d{4})\s+to\s+(\d{1,2}[/-]\d{1,2}[/-]\d{4})',
+        ]
+        
+        for pattern in date_range_patterns:
+            match = re.search(pattern, all_clause_text, re.IGNORECASE)
+            if match:
+                if not entities.get("effective_date"):
+                    entities["effective_date"] = match.group(1).strip()
+                entities["termination_date"] = match.group(2).strip()
+                logger.info("Entities: Enhanced termination_date from clauses: %s", entities["termination_date"])
+                break
+        
+        # Also check for termination-specific phrases in clauses
+        if not entities.get("termination_date") or entities.get("termination_date") == "null":
+            termination_patterns = [
+                r'(?:expires?|ends?|terminates?|valid until)\s+(?:on\s+)?([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
+                r'(?:expires?|ends?|terminates?|valid until)\s+(?:on\s+)?(\d{4}[/-]\d{1,2}[/-]\d{1,2})',
+                r'(?:expires?|ends?|terminates?|valid until)\s+(?:on\s+)?(\d{1,2}[/-]\d{1,2}[/-]\d{4})',
+            ]
+            for pattern in termination_patterns:
+                match = re.search(pattern, all_clause_text, re.IGNORECASE)
+                if match:
+                    entities["termination_date"] = match.group(1).strip()
+                    logger.info("Entities: Enhanced termination_date from clause patterns: %s", entities["termination_date"])
+                    break
+    
+    return entities
+
+
 def run_pipeline(filename: str, file_bytes: bytes, *, chunk_size: int = 1500, chunk_overlap: int = 150, user_background: str = "") -> Dict[str, Any]:
     """
     Full end-to-end pipeline:
@@ -778,10 +1256,11 @@ def run_pipeline(filename: str, file_bytes: bytes, *, chunk_size: int = 1500, ch
         3) Split
         4) Entities
         5) Clause extraction
-        6) Explanations
-        7) Risk tags/scores
-        8) Risk explanation
-        9) Scenarios (personalized with user_background if provided)
+        6) Enhance entities from clauses (fill missing dates, etc.)
+        7) Explanations
+        8) Risk tags/scores
+        9) Risk explanation
+        10) Scenarios (personalized with user_background if provided)
     Returns a single dict ready for UI/JSON download.
     """
     text = extract_text_from_bytes(filename, file_bytes)
@@ -792,6 +1271,13 @@ def run_pipeline(filename: str, file_bytes: bytes, *, chunk_size: int = 1500, ch
     chunks = split_text(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     entities = extract_entities(text)
     clauses = extract_clauses_from_chunks(chunks)
+    
+    # Enhance entities with information from clauses (especially dates)
+    entities_dict = entities.get("entities", entities)
+    if isinstance(entities_dict, dict):
+        entities_dict = _enhance_entities_from_clauses(entities_dict, clauses)
+        entities = {"entities": entities_dict}
+    
     explained = add_plain_explanations(clauses)
     risked = add_risk_scores(explained)
     risk_text = add_risk_text(risked)
@@ -836,6 +1322,232 @@ def _extract_json(s: str) -> str:
                     end = i + 1
                     return s[start:end]
     return s  # last resort; let json.loads fail for caller
+
+
+def _repair_truncated_json(json_str: str) -> str:
+    """Try to repair truncated JSON by closing incomplete strings and objects."""
+    if not json_str or not json_str.strip():
+        return json_str
+    
+    json_str = json_str.strip()
+    original = json_str
+    
+    # Track state while parsing
+    in_string = False
+    escape_next = False
+    depth_braces = 0
+    depth_brackets = 0
+    last_valid_pos = -1
+    
+    # Find the last valid position before truncation
+    for i, char in enumerate(json_str):
+        if escape_next:
+            escape_next = False
+            last_valid_pos = i
+            continue
+        
+        if char == '\\':
+            escape_next = True
+            last_valid_pos = i
+            continue
+        
+        if char == '"':
+            in_string = not in_string
+            last_valid_pos = i
+            continue
+        
+        if in_string:
+            last_valid_pos = i
+            continue
+        
+        # Outside string
+        if char == '{':
+            depth_braces += 1
+            last_valid_pos = i
+        elif char == '}':
+            depth_braces -= 1
+            last_valid_pos = i
+        elif char == '[':
+            depth_brackets += 1
+            last_valid_pos = i
+        elif char == ']':
+            depth_brackets -= 1
+            last_valid_pos = i
+        else:
+            last_valid_pos = i
+    
+    # If we're inside a string, we need to close it
+    if in_string:
+        # Find where the string started (go backwards to find the opening quote)
+        # Look for the last complete key-value pair or array element
+        # Try to find a reasonable cut point
+        cut_pos = last_valid_pos + 1
+        
+        # Go backwards from truncation to find where we can safely cut
+        # Look for the start of the current incomplete field
+        # Try to find a pattern like: "field": "incomplete text
+        # We want to close it at a reasonable point
+        
+        # Find the last complete key-value separator before truncation
+        last_colon = json_str.rfind(':', 0, cut_pos)
+        if last_colon > 0:
+            # Check if there's an opening quote after the colon
+            after_colon = json_str[last_colon+1:cut_pos].strip()
+            if after_colon.startswith('"'):
+                # We're in a string value, need to close it
+                # Find the opening quote of this string
+                string_start = last_colon + 1 + after_colon.index('"')
+                # Close the string at the current position
+                json_str = json_str[:cut_pos] + '"'
+                last_valid_pos = cut_pos
+            else:
+                # Not in a string value, might be in a key name
+                json_str = json_str[:cut_pos] + '"'
+        else:
+            # No colon found, just close the string
+            json_str = json_str[:cut_pos] + '"'
+    
+    # Now close any incomplete objects/arrays
+    # We need to close in reverse order: first the current object, then parent objects
+    result = json_str[:last_valid_pos + 1 + (1 if in_string else 0)]
+    
+    # Close the current object if we're inside one
+    if depth_braces > 0:
+        result += '}' * depth_braces
+    
+    # Close the array if we're inside one
+    if depth_brackets > 0:
+        result += ']' * depth_brackets
+    
+    return result
+
+
+def _extract_partial_entities(incomplete_json: str) -> Dict[str, Any]:
+    """Try to extract partial entities from incomplete JSON."""
+    entities = {
+        "parties": [],
+        "effective_date": None,
+        "termination_date": None,
+        "governing_law": None,
+        "notice_periods": None,
+        "liability_provisions": None,
+        "confidentiality_terms": None,
+        "payment_terms": None,
+        "ip_rights": None
+    }
+    
+    # Try regex extraction from the incomplete JSON string
+    # Extract parties array - handle both complete and incomplete arrays
+    # First try complete array
+    parties_match = re.search(r'"parties"\s*:\s*\[(.*?)\]', incomplete_json, re.DOTALL)
+    if not parties_match:
+        # Try incomplete array (no closing bracket)
+        parties_match = re.search(r'"parties"\s*:\s*\[(.*)', incomplete_json, re.DOTALL)
+    
+    if parties_match:
+        parties_str = parties_match.group(1)
+        # Extract quoted strings - handle incomplete strings at the end
+        party_names = re.findall(r'"([^"]+)"', parties_str)
+        # Also try to extract last incomplete string if any
+        if '"' in parties_str and not parties_str.strip().endswith('"'):
+            # Try to extract up to the last quote
+            last_quote = parties_str.rfind('"')
+            if last_quote > 0:
+                before_quote = parties_str[:last_quote]
+                # Extract complete strings before the incomplete one
+                complete_parties = re.findall(r'"([^"]+)"', before_quote)
+                party_names = complete_parties
+        if party_names:
+            entities["parties"] = party_names
+    
+    # Extract dates - handle incomplete strings
+    # Pattern for complete dates
+    date_pattern_complete = r'"(effective_date|termination_date)"\s*:\s*"([^"]+)"'
+    date_matches = re.findall(date_pattern_complete, incomplete_json)
+    for key, value in date_matches:
+        if value and len(value) > 3:
+            entities[key] = value
+    
+    # Pattern for incomplete dates (truncated strings)
+    date_pattern_incomplete = r'"(effective_date|termination_date)"\s*:\s*"([^"]+)'
+    date_matches_incomplete = re.findall(date_pattern_incomplete, incomplete_json)
+    for key, value in date_matches_incomplete:
+        # Only use if we haven't already found a complete value
+        if not entities.get(key) and value and len(value) > 3:
+            # Take what we have, even if incomplete
+            entities[key] = value
+    
+    # Extract other string fields - handle both complete and incomplete
+    string_fields = ["governing_law", "notice_periods", "liability_provisions", 
+                     "confidentiality_terms", "payment_terms", "ip_rights"]
+    for field in string_fields:
+        # Try complete string first
+        pattern_complete = f'"{field}"\\s*:\\s*"([^"]+)"'
+        match = re.search(pattern_complete, incomplete_json)
+        if match:
+            value = match.group(1)
+            if value and len(value) > 2:
+                entities[field] = value
+        else:
+            # Try incomplete string
+            pattern_incomplete = f'"{field}"\\s*:\\s*"([^"]+)'
+            match = re.search(pattern_incomplete, incomplete_json)
+            if match:
+                value = match.group(1)
+                # Only use if meaningful length (at least 3 chars)
+                if value and len(value) > 2:
+                    entities[field] = value
+    
+    return entities
+
+
+def _extract_partial_risk_scores(incomplete_json: str, clauses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract partial risk scores from incomplete JSON array."""
+    result = []
+    
+    # Try to extract complete objects from the array
+    # Pattern: { "id": ..., "Risk score": ..., ... }
+    # We'll try to extract any complete risk score entries
+    
+    # Split by objects (look for complete { ... } patterns)
+    # This is a simple approach - extract risk scores that are complete
+    risk_score_pattern = r'"Risk score"\s*:\s*"(high|medium|low)"'
+    risk_tag_pattern = r'"risk tag"\s*:\s*"([^"]+)"'
+    
+    # Find all risk scores and tags in the incomplete JSON
+    risk_scores = re.findall(risk_score_pattern, incomplete_json, re.IGNORECASE)
+    risk_tags = re.findall(risk_tag_pattern, incomplete_json, re.IGNORECASE)
+    
+    # Try to match by ID if possible
+    id_pattern = r'"id"\s*:\s*"?(\d+)"?'
+    ids = re.findall(id_pattern, incomplete_json)
+    
+    # Build result by matching clauses with extracted risk data
+    for i, clause in enumerate(clauses):
+        clause_copy = clause.copy()
+        
+        # Try to match by ID first
+        clause_id = str(clause.get("id", i + 1))
+        if clause_id in ids:
+            idx = ids.index(clause_id)
+            if idx < len(risk_scores):
+                clause_copy["Risk score"] = risk_scores[idx].lower()
+            if idx < len(risk_tags):
+                clause_copy["risk tag"] = risk_tags[idx]
+        else:
+            # Match by position
+            if i < len(risk_scores):
+                clause_copy["Risk score"] = risk_scores[i].lower()
+            if i < len(risk_tags):
+                clause_copy["risk tag"] = risk_tags[i]
+        
+        # Ensure defaults if not found
+        clause_copy.setdefault("Risk score", "medium")
+        clause_copy.setdefault("risk tag", "Legal")
+        
+        result.append(clause_copy)
+    
+    return result if result else clauses
 
 
 if __name__ == "__main__":
