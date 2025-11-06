@@ -2,6 +2,7 @@
 import os
 import json
 import base64
+from datetime import datetime
 import streamlit as st
 try:
     import plotly.graph_objects as go
@@ -18,6 +19,7 @@ from synaptica_clausewise_workflow import (
     run_pipeline,
     SUPPORTED_EXTS,
 )
+from legal_rag_bot import create_rag_bot, is_rag_available
 
 APP_NAME = "Synaptica | clauseWise"
 
@@ -164,7 +166,7 @@ with st.sidebar:
             st.session_state["_hf_token_set"] = True
             st.rerun()
 
-    st.markdown("**IBM Granite (classification)** and **Mixtral (analysis)** are used by default.")
+    st.markdown("**IBM Granite (classification)** and **Mixtral (analysis & RAG bot)** are used by default.")
     st.caption("You can override models via environment variables: GRANITE_REPO, MAIN_LLM_REPO.")
     st.divider()
     st.markdown("### Processing Options")
@@ -251,7 +253,7 @@ if uploaded:
         help="This information will be used to generate personalized, realistic risk scenarios based on your actual circumstances."
     )
     
-    run = st.button("▶️ Run analysis", type="primary", use_container_width=True, key="run_analysis")
+    run = st.button("▶️ Run analysis", type="primary", width='stretch', key="run_analysis")
     if run:
         with st.spinner("Analyzing document with IBM Granite + Mixtral..."):
             try:
@@ -266,6 +268,17 @@ if uploaded:
     # Use cached analysis if present
     result = st.session_state.get("analysis_result") if st.session_state.get("uploaded_name") == uploaded.name else None
     if result:
+        # Check for errors in the result
+        entities = result.get("entities", {})
+        if isinstance(entities, dict) and entities.get("_error"):
+            st.warning(f"⚠️ Entity extraction had issues: {entities.get('_error')}. Some entities may be missing.")
+        
+        clauses = result.get("clauses", [])
+        if clauses:
+            # Check if risk scores are using fallback (all medium)
+            risk_scores = [c.get("Risk score", "medium") for c in clauses]
+            if all(score == "medium" for score in risk_scores) and len(clauses) > 0:
+                st.warning("⚠️ Risk assessment may have used fallback values. Some risk scores may not be accurate.")
         # ---- Header summary ----
         col1, col2, col3, col4 = st.columns([2,2,2,2])
         with col1:
@@ -382,7 +395,7 @@ if uploaded:
                         plot_bgcolor="rgba(0,0,0,0)",
                         font=dict(color="#ffffff"),
                     )
-                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                    st.plotly_chart(fig, width='stretch', config={"displayModeBar": False})
             
             with col_legend:
                 st.markdown("""
@@ -504,5 +517,155 @@ if uploaded:
 
         # subtle spacing only, no white divider
         _download_button(result, download_name)
+        
+        # ============================================
+        # Legal RAG Bot Section (at the end)
+        # ============================================
+        st.markdown("---")
+        st.markdown("## 🤖 Legal Query Assistant")
+        st.markdown("Ask questions about the processed document using our AI assistant powered by Mixtral (stable conversational model).")
+        
+        # RAG bot is always available - lightweight implementation
+        st.info("💡 The RAG bot uses lightweight text matching for fast responses on any device.")
+        
+        # Initialize chat history
+        if "rag_chat_history" not in st.session_state:
+            st.session_state.rag_chat_history = []
+        
+        # Initialize RAG bot if not already done
+        if "rag_bot" not in st.session_state or st.session_state.get("rag_bot_result_key") != id(result):
+            try:
+                st.session_state.rag_bot = create_rag_bot(result)
+                st.session_state.rag_bot_result_key = id(result)
+                st.session_state.rag_chat_history = []  # Clear history when new document is processed
+                
+                # Check if knowledge base has content
+                if st.session_state.rag_bot.kb_items and len(st.session_state.rag_bot.kb_items) > 0:
+                    st.success("✅ RAG bot initialized with the current document analysis.")
+                else:
+                    st.warning("⚠️ RAG bot initialized but document has no extractable clauses or entities. The bot may not be able to answer questions.")
+                
+                # Check if LLM initialized properly
+                if not st.session_state.rag_bot.llm:
+                    error_msg = getattr(st.session_state.rag_bot, 'llm_error', 'Unknown error')
+                    st.error(f"❌ RAG bot LLM initialization failed: {error_msg}. Please check your HUGGINGFACEHUB_API_TOKEN.")
+            except Exception as e:
+                st.error(f"Failed to initialize RAG bot: {str(e)}. Please check your configuration and try again.")
+                st.session_state.rag_bot = None
+        
+        # Chat interface
+        if st.session_state.rag_bot:
+            # Display chat history
+            st.markdown("### 💬 Chat History")
+            
+            # Chat container
+            chat_container = st.container()
+            with chat_container:
+                for i, msg in enumerate(st.session_state.rag_chat_history):
+                    if msg["role"] == "user":
+                        st.markdown(f"""
+                        <div style='background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                                    color: white; padding: 12px 16px; border-radius: 12px; 
+                                    margin-bottom: 12px; margin-left: 20%;'>
+                            <div style='font-weight: 600; margin-bottom: 4px;'>You</div>
+                            <div>{msg["content"]}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""
+                        <div style='background: #f1f5f9; color: #0f172a; padding: 12px 16px; 
+                                    border-radius: 12px; margin-bottom: 12px; margin-right: 20%;
+                                    border-left: 4px solid #4338ca;'>
+                            <div style='font-weight: 600; margin-bottom: 4px; color: #4338ca;'>🤖 Legal Assistant</div>
+                            <div style='line-height: 1.6;'>{msg["content"]}</div>
+                            {f'<div style="font-size: 0.85rem; color: #64748b; margin-top: 8px; padding-top: 8px; border-top: 1px solid #e2e8f0;">📚 Based on: {msg.get("sources", "Document context")}</div>' if msg.get("sources") else ''}
+                        </div>
+                        """, unsafe_allow_html=True)
+            
+            # Query input
+            st.markdown("### ✍️ Ask a Question")
+            col_query, col_send = st.columns([5, 1])
+            
+            with col_query:
+                user_query = st.text_input(
+                    "Enter your question about the document",
+                    placeholder="e.g., What are the high-risk clauses? What are the termination terms? Who are the parties?",
+                    key="rag_query_input",
+                    label_visibility="collapsed"
+                )
+            
+            with col_send:
+                st.markdown("<br>", unsafe_allow_html=True)  # Spacing
+                send_button = st.button("💬 Ask", type="primary", width='stretch', key="rag_send_button")
+            
+            # Example questions
+            st.markdown("**💡 Example Questions:**")
+            example_cols = st.columns(4)
+            examples = [
+                "What are the high-risk clauses?",
+                "What are the payment terms?",
+                "Who are the parties involved?",
+                "What is the termination clause?"
+            ]
+            example_selected = None
+            for i, example in enumerate(examples):
+                with example_cols[i]:
+                    if st.button(example, key=f"example_{i}", width='stretch'):
+                        example_selected = example
+            
+            # Process query (from input or example button)
+            if (send_button and user_query) or example_selected:
+                query_to_use = example_selected if example_selected else user_query
+                with st.spinner("🤔 Analyzing your question..."):
+                    try:
+                        # Add user message to history
+                        st.session_state.rag_chat_history.append({
+                            "role": "user",
+                            "content": query_to_use,
+                            "timestamp": datetime.now().isoformat()
+                        })
+                        
+                        # Get answer from RAG bot
+                        response = st.session_state.rag_bot.answer_query(query_to_use)
+                        
+                        # Format sources
+                        sources_text = ""
+                        if response.get("context_sources"):
+                            sources_list = []
+                            for source in response["context_sources"][:3]:  # Show top 3 sources
+                                if source.get("clause_id"):
+                                    sources_list.append(f"Clause {source['clause_id']} ({source.get('title', 'Untitled')})")
+                                elif source.get("type"):
+                                    sources_list.append(source["type"].replace("_", " ").title())
+                            if sources_list:
+                                sources_text = ", ".join(sources_list)
+                        
+                        # Add assistant response to history
+                        st.session_state.rag_chat_history.append({
+                            "role": "assistant",
+                            "content": response["answer"],
+                            "sources": sources_text,
+                            "timestamp": response["timestamp"]
+                        })
+                        
+                        # Clear input and rerun to show new message
+                        st.rerun()
+                        
+                    except Exception as e:
+                        st.error(f"Error processing query: {e}")
+                        st.session_state.rag_chat_history.append({
+                            "role": "assistant",
+                            "content": f"I encountered an error: {str(e)}. Please try again.",
+                            "timestamp": datetime.now().isoformat()
+                        })
+                        st.rerun()
+            
+            # Clear chat button
+            if st.session_state.rag_chat_history:
+                if st.button("🗑️ Clear Chat History", key="clear_rag_chat"):
+                    st.session_state.rag_chat_history = []
+                    st.rerun()
+        else:
+            st.info("RAG bot is not available. Please ensure the document analysis completed successfully.")
 else:
     st.info("Start by uploading a file. Supported: PDF, DOCX, TXT.")
